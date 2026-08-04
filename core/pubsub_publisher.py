@@ -43,6 +43,15 @@ class PubSubPublisher:
         self.metrics = metrics or Metrics()
         self.logger = logger or logging.getLogger(__name__)
 
+    def ping(self) -> bool:
+        """
+        验证 Redis Publisher 连接可用。
+
+        Returns:
+            bool: Redis 返回 PONG 时为 `True`。
+        """
+        return bool(self._cli.ping())
+
     def publish(self, payload: Dict[str, Any], max_retries: int = 3, backoff_ms: int = 100) -> None:
         data = json.dumps(payload, ensure_ascii=False)
         for i in range(max_retries):

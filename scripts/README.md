@@ -27,6 +27,8 @@
   - 用途：真实实时行情控制面空白启动入口。
   - 场景：不预设初始订阅，启动后等待 Redis 控制通道的 `subscribe/unsubscribe/status`。
   - 默认：优先读取 `config/realtime_control.yml`。
+  - 恢复：xtdata 会话异常结束后执行 60 秒软期限恢复，失败时以非零状态退出。
+  - 健康：固定写入 `xt:bridge:health:current`，默认每 5 秒刷新、TTL 20 秒。
   - 注意：不要与 Mock 控制入口共用同一行情 topic 同时运行。
 
 - `run_realtime_mock_control.py`

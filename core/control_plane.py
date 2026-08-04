@@ -40,10 +40,18 @@ class ControlPlane(threading.Thread):
         self._svc = svc
         self._accept = set(accept_strategies or [])
         self._stop_evt = threading.Event()
+        self._ready_evt = threading.Event()
+        self._startup_error: Optional[str] = None
         self._logger = logger
 
     def _ensure_pubsub(self) -> None:
-        """方法说明：重建 PubSub 并订阅控制通道"""
+        """
+        重建 PubSub 并订阅控制通道。
+
+        Returns:
+            None
+        """
+        self._ready_evt.clear()
         try:
             if self._pubsub:
                 self._pubsub.close()
@@ -51,10 +59,47 @@ class ControlPlane(threading.Thread):
             pass
         self._pubsub = self._r.pubsub()
         self._pubsub.subscribe(self._channel)
+        self._ready_evt.set()
+
+    def ping(self) -> bool:
+        """
+        验证控制面 Redis 连接可用。
+
+        Returns:
+            bool: Redis 返回 PONG 时为 `True`。
+        """
+        return bool(self._r.ping())
+
+    def wait_until_ready(self, timeout: float = 5.0) -> bool:
+        """
+        等待控制通道完成初次订阅。
+
+        Args:
+            timeout (float): 最大等待秒数。
+
+        Returns:
+            bool: 控制通道已建立时返回 `True`。
+        """
+        return self._ready_evt.wait(max(0.0, float(timeout)))
+
+    @property
+    def startup_error(self) -> Optional[str]:
+        """返回控制线程初次启动失败摘要。"""
+        return self._startup_error
+
+    def clear_registry(self) -> List[str]:
+        """
+        清理旧实时进程遗留的协议订阅记录。
+
+        Returns:
+            List[str]: 已清理的旧 `sub_id` 列表。
+        """
+        return self._registry.clear_all()
 
     def stop(self) -> None:
         """方法说明：请求线程停止并关闭 PubSub"""
         self._stop_evt.set()
+        self._ready_evt.clear()
         try:
             if self._pubsub:
                 self._pubsub.close()
@@ -63,6 +108,9 @@ class ControlPlane(threading.Thread):
 
     def _ack(self, strategy_id: str, payload: Dict[str, Any]) -> None:
         ch = f"{self._ack_prefix}:{strategy_id}"
+        identity_provider = getattr(self._svc, "protocol_identity", None)
+        if callable(identity_provider):
+            payload = {**payload, **identity_provider()}
         try:
             self._r.publish(ch, json.dumps(payload, ensure_ascii=False))
         except Exception:
@@ -70,6 +118,16 @@ class ControlPlane(threading.Thread):
 
     def _allowed(self, strategy_id: str) -> bool:
         return (not self._accept) or (strategy_id in self._accept)
+
+    def _mutation_error(self) -> Optional[str]:
+        """
+        获取实时服务对订阅修改的状态门禁结果。
+
+        Returns:
+            Optional[str]: 可修改时为 `None`，否则为稳定错误码。
+        """
+        provider = getattr(self._svc, "control_mutation_error", None)
+        return provider() if callable(provider) else None
 
     def _handle_subscribe(self, cmd: Dict[str, Any]) -> None:
         strategy_id = str(cmd.get("strategy_id", "")).strip()
@@ -84,24 +142,35 @@ class ControlPlane(threading.Thread):
         if not codes or not periods:
             self._ack(strategy_id, {"ok": False, "error": "codes/periods required"})
             return
-        # 生成 sub_id，持久化
+        mutation_error = self._mutation_error()
+        if mutation_error:
+            self._ack(strategy_id, {"ok": False, "error": mutation_error})
+            return
+
+        # 先建立底层订阅，再保存协议记录，避免失败订阅残留在 Registry。
         sub_id = self._registry.gen_sub_id()
         spec = SubscriptionSpec(strategy_id=strategy_id, codes=codes, periods=periods,
                                 mode=mode, preload_days=preload_days, topic=topic,
                                 created_at=int(__import__('time').time()))
-        self._registry.save(sub_id, spec)
-        # 执行：预热 + 注册订阅（使用服务封装）
         try:
             self._svc.add_subscription(codes=codes, periods=periods, preload_days=preload_days)
+            try:
+                self._registry.save(sub_id, spec)
+            except Exception:
+                self._svc.remove_subscription(codes=codes, periods=periods)
+                raise
             self._ack(strategy_id, {"ok": True, "action": "subscribe", "sub_id": sub_id,
                                     "codes": codes, "periods": periods, "mode": mode, "topic": topic})
         except Exception as e:
-            # 回滚注册表
             self._registry.delete(sub_id)
             self._ack(strategy_id, {"ok": False, "error": f"subscribe failed: {e}"})
 
     def _handle_unsubscribe(self, cmd: Dict[str, Any]) -> None:
         strategy_id = str(cmd.get("strategy_id", "")).strip()
+        mutation_error = self._mutation_error()
+        if mutation_error:
+            self._ack(strategy_id or "unknown", {"ok": False, "error": mutation_error})
+            return
         codes = [str(x).strip() for x in (cmd.get("codes") or []) if str(x).strip()]
         periods = [str(x).strip() for x in (cmd.get("periods") or []) if str(x).strip()]
         sub_id = cmd.get("sub_id")
@@ -113,12 +182,13 @@ class ControlPlane(threading.Thread):
                 return
             codes = meta.get("codes", []) if not codes else codes
             periods = meta.get("periods", []) if not periods else periods
-            self._registry.delete(sub_id)
         if not codes or not periods:
             self._ack(strategy_id or "unknown", {"ok": False, "error": "codes/periods required"})
             return
         try:
             self._svc.remove_subscription(codes=codes, periods=periods)
+            if sub_id:
+                self._registry.delete(sub_id)
             self._ack(strategy_id or "unknown", {"ok": True, "action": "unsubscribe",
                                                   "codes": codes, "periods": periods})
         except Exception as e:
@@ -131,16 +201,32 @@ class ControlPlane(threading.Thread):
                                 "subs": self._registry.list_all()})
 
     def run(self) -> None:
-        """方法说明：主循环；带异常恢复的 get_message"""
-        self._ensure_pubsub()
+        """
+        运行控制命令消费循环。
+
+        Returns:
+            None
+        """
+        try:
+            self._ensure_pubsub()
+        except Exception as exc:
+            self._startup_error = f"{type(exc).__name__}: {exc}"
+            if self._logger:
+                self._logger.exception("control-plane 启动失败")
+            return
         while not self._stop_evt.is_set():
             try:
                 msg = self._pubsub.get_message(ignore_subscribe_messages=True, timeout=1.0)
             except (redis.exceptions.ConnectionError, OSError) as e:
                 if self._logger:
                     self._logger.warning("control-plane pubsub 断开，将重连：%s", e)
+                self._ready_evt.clear()
                 time.sleep(0.5)
-                self._ensure_pubsub()
+                try:
+                    self._ensure_pubsub()
+                except Exception as reconnect_error:
+                    if self._logger:
+                        self._logger.warning("control-plane 重连失败：%s", reconnect_error)
                 continue
 
             if not msg:

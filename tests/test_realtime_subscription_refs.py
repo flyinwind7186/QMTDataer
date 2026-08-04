@@ -17,8 +17,6 @@ from __future__ import annotations
 import unittest
 from unittest import mock
 
-from core.realtime_service import RealtimeConfig, RealtimeSubscriptionService
-
 
 class _FakePublisher:
     """
@@ -86,10 +84,17 @@ class TestRealtimeSubscriptionRefs(unittest.TestCase):
         Returns:
             None
         """
+        from core import realtime_service
+
         fake_xtdata = _FakeXtdata()
-        with mock.patch("core.realtime_service.xtdata", fake_xtdata):
-            svc = RealtimeSubscriptionService(
-                RealtimeConfig(mode="close_only", periods=["1m"], codes=[], preload_days=0),
+        with mock.patch.object(realtime_service, "xtdata", fake_xtdata):
+            svc = realtime_service.RealtimeSubscriptionService(
+                realtime_service.RealtimeConfig(
+                    mode="close_only",
+                    periods=["1m"],
+                    codes=[],
+                    preload_days=0,
+                ),
                 publisher=_FakePublisher(),
             )
             svc.add_subscription(["510050.SH"], ["1m"], preload_days=0)

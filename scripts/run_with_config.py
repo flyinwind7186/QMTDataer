@@ -130,12 +130,16 @@ def run_from_config(cfg: AppConfig) -> None:
     else:
         logging.info("[BOOT] mock mode active, skip QMT connector")
 
-    # 3) Publisher
+    # 3) Publisher 与 Redis 显式探测
+    metrics = Metrics()
     publisher = PubSubPublisher(
         host=cfg.redis.host, port=cfg.redis.port,
         password=cfg.redis.password, db=cfg.redis.db,
-        topic=cfg.redis.topic
+        topic=cfg.redis.topic, metrics=metrics,
     )
+    publisher_ping = getattr(publisher, "ping", None)
+    if callable(publisher_ping) and not publisher_ping():
+        raise RuntimeError("Redis Publisher PING 失败")
 
     # 4) Realtime Service
     rt_cfg = RealtimeConfig(
@@ -144,48 +148,57 @@ def run_from_config(cfg: AppConfig) -> None:
         codes=cfg.subscription.codes,
         close_delay_ms=cfg.subscription.close_delay_ms,
         preload_days=cfg.subscription.preload_days,
+        reconnect_timeout_sec=cfg.subscription.reconnect_timeout_sec,
+        reconnect_backoff_sec=cfg.subscription.reconnect_backoff_sec,
         mock=mock_cfg,
     )
     svc = RealtimeSubscriptionService(rt_cfg, publisher)
 
     # 5) 可选：健康上报
-    metrics = Metrics()
     health_thr = None
-    try:
-        h = cfg.health
-        if isinstance(h, HealthSection) and h.enabled:
-            extra = {
-                "codes": cfg.subscription.codes,
-                "periods": cfg.subscription.periods,
-                "mode": cfg.subscription.mode,
-                "topic": cfg.redis.topic,
-                "instance_tag": h.instance_tag,
-            }
-            health_thr = HealthReporter(
-                host=cfg.redis.host, port=cfg.redis.port, password=cfg.redis.password,
-                key_prefix=h.key_prefix, metrics=metrics,
-                interval_sec=int(h.interval_sec), ttl_sec=int(h.ttl_sec),
-                extra_info=extra
-            )
-            health_thr.start()
-            logging.info("[BOOT] health reporter started")
-    except Exception as e:
-        logging.warning("[BOOT] health reporter disabled: %s", e)
+    h = cfg.health
+    if isinstance(h, HealthSection) and h.enabled:
+        extra = {
+            "codes": cfg.subscription.codes,
+            "periods": cfg.subscription.periods,
+            "mode": cfg.subscription.mode,
+            "topic": cfg.redis.topic,
+            "instance_tag": h.instance_tag,
+        }
+        health_thr = HealthReporter(
+            host=cfg.redis.host, port=cfg.redis.port, password=cfg.redis.password,
+            db=cfg.redis.db,
+            key_prefix=h.key_prefix, metrics=metrics,
+            interval_sec=int(h.interval_sec), ttl_sec=int(h.ttl_sec),
+            extra_info=extra, current_key=h.current_key,
+            state_provider=getattr(svc, "health_snapshot", None),
+        )
 
     # 6) 可选：控制面（动态订阅）
     ctrl_thr = None
     if cfg.control.enabled:
-        try:
-            ctrl_thr = ControlPlane(
-                host=cfg.redis.host, port=cfg.redis.port, password=cfg.redis.password, db=cfg.redis.db,
-                channel=cfg.control.channel, ack_prefix=cfg.control.ack_prefix,
-                registry_prefix=cfg.control.registry_prefix, svc=svc,
-                accept_strategies=cfg.control.accept_strategies, logger=logging.getLogger("ControlPlane")
-            )
-            ctrl_thr.start()
-            logging.info("[BOOT] control plane started channel=%s ack=%s", cfg.control.channel, cfg.control.ack_prefix)
-        except Exception as e:
-            logging.warning("[BOOT] control plane disabled: %s", e)
+        ctrl_thr = ControlPlane(
+            host=cfg.redis.host, port=cfg.redis.port, password=cfg.redis.password, db=cfg.redis.db,
+            channel=cfg.control.channel, ack_prefix=cfg.control.ack_prefix,
+            registry_prefix=cfg.control.registry_prefix, svc=svc,
+            accept_strategies=cfg.control.accept_strategies, logger=logging.getLogger("ControlPlane")
+        )
+        if not ctrl_thr.ping():
+            raise RuntimeError("Redis ControlPlane PING 失败")
+        cleared_sub_ids = ctrl_thr.clear_registry()
+        if cleared_sub_ids:
+            logging.warning("[BOOT] 已清理旧实时进程 Registry 记录: count=%d", len(cleared_sub_ids))
+        ctrl_thr.start()
+        if not ctrl_thr.wait_until_ready(timeout=5.0):
+            error = ctrl_thr.startup_error or "控制通道未在 5 秒内建立"
+            ctrl_thr.stop()
+            ctrl_thr.join(timeout=1.0)
+            raise RuntimeError(f"ControlPlane 启动失败: {error}")
+        logging.info("[BOOT] control plane started channel=%s ack=%s", cfg.control.channel, cfg.control.ack_prefix)
+
+    if health_thr:
+        health_thr.start()
+        logging.info("[BOOT] health reporter started key=%s", h.current_key)
 
     # 7) 阻塞运行（内部会做历史预热 + 实时订阅 + 推送）
     logging.info("[BOOT] starting realtime service ...")

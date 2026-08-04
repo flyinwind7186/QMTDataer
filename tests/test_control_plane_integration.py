@@ -49,6 +49,21 @@ class _FakeService:
         ], key=lambda item: (item["code"], item["period"]))
         return {"subs": subs, "last_published": {}}
 
+    @staticmethod
+    def control_mutation_error():
+        """模拟 READY 状态，允许订阅修改。"""
+        return None
+
+    @staticmethod
+    def protocol_identity():
+        """返回协议版本 2 的实时进程身份。"""
+        return {
+            "instance_id": "integration-realtime-instance",
+            "instance_started_at_ms": 1,
+            "session_generation": 1,
+            "protocol_version": 2,
+        }
+
 
 class TestControlPlaneIntegration(unittest.TestCase):
     def setUp(self) -> None:
@@ -137,6 +152,8 @@ class TestControlPlaneIntegration(unittest.TestCase):
         self.assertTrue(ack.get("ok"))
         self.assertEqual(ack.get("action"), "subscribe")
         self.assertIn("sub_id", ack)
+        self.assertEqual(ack.get("instance_id"), "integration-realtime-instance")
+        self.assertEqual(ack.get("protocol_version"), 2)
         self.assertEqual(len(self.svc.add_calls), 1)
         sub_id = ack["sub_id"]
         self.assertIn(sub_id, self.registry.list_all())
@@ -148,6 +165,7 @@ class TestControlPlaneIntegration(unittest.TestCase):
         self.assertTrue(ack2.get("ok"))
         self.assertEqual(ack2.get("action"), "status")
         self.assertIn("status", ack2)
+        self.assertEqual(ack2.get("session_generation"), 1)
 
         cmd_un = {"action": "unsubscribe", "strategy_id": self.strategy, "sub_id": sub_id}
         self.cli.publish(self.channel, json.dumps(cmd_un, ensure_ascii=False))

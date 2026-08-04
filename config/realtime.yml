@@ -31,6 +31,8 @@ subscription:
   mode: close_only        # close_only: 仅收盘（K线收敛）时推一次；forming_and_close: 生成中也推
   close_delay_ms: 100     # 收盘触发推送前延迟（毫秒，防抖用途）
   preload_days: 3         # 启动时预热历史天数（QMT 需先 download_history_data 才能 get）
+  reconnect_timeout_sec: 60
+  reconnect_backoff_sec: [1, 2, 4, 8, 10]
 
 logging:
   level: INFO             # DEBUG/INFO/WARNING/ERROR
@@ -42,8 +44,9 @@ logging:
     backup_count: 5
 
 health:
-  enabled: false
+  enabled: true
   key_prefix: xt:bridge:health  # 健康上报 Redis Key 前缀
+  current_key: xt:bridge:health:current
   interval_sec: 5               # 上报间隔
   ttl_sec: 20                   # 键过期时间（秒）
   instance_tag: bridge-A        # 可选：实例标识（用于区分多实例）

@@ -102,6 +102,10 @@ class SubscriptionSection:
     mode: str = "close_only"          # close_only | forming_and_close
     close_delay_ms: int = 100         # 推送收盘条时的延迟判定（ms）
     preload_days: int = 3             # 启动预加载历史天数
+    reconnect_timeout_sec: float = 60.0
+    reconnect_backoff_sec: List[float] = field(
+        default_factory=lambda: [1.0, 2.0, 4.0, 8.0, 10.0]
+    )
 
 
 @dataclass
@@ -138,6 +142,7 @@ class HealthSection:
     """
     enabled: bool = False
     key_prefix: str = "xt:bridge:health"
+    current_key: str = "xt:bridge:health:current"
     interval_sec: int = 5
     ttl_sec: int = 20
     instance_tag: Optional[str] = None
@@ -250,6 +255,11 @@ def load_config(path: str, allow_empty_subscription: bool = False) -> AppConfig:
     mode = str(sub_raw.get("mode", "close_only")).lower()
     close_delay_ms = int(sub_raw.get("close_delay_ms", 100))
     preload_days = int(sub_raw.get("preload_days", 3))
+    reconnect_timeout_sec = float(sub_raw.get("reconnect_timeout_sec", 60.0))
+    reconnect_backoff_sec = [
+        float(item)
+        for item in (sub_raw.get("reconnect_backoff_sec") or [1, 2, 4, 8, 10])
+    ]
 
     if not codes and not allow_empty_subscription:
         raise ValueError("subscription.codes 不能为空")
@@ -260,6 +270,10 @@ def load_config(path: str, allow_empty_subscription: bool = False) -> AppConfig:
             raise ValueError(f"subscription.periods 包含不支持的周期：{p}，允许：{_ALLOWED_PERIODS}")
     if mode not in _ALLOWED_MODES:
         raise ValueError(f"subscription.mode 不合法：{mode}，允许：{_ALLOWED_MODES}")
+    if reconnect_timeout_sec <= 0:
+        raise ValueError("subscription.reconnect_timeout_sec 必须大于 0")
+    if not reconnect_backoff_sec or any(item < 0 for item in reconnect_backoff_sec):
+        raise ValueError("subscription.reconnect_backoff_sec 必须是非负秒数列表")
 
     sub_sec = SubscriptionSection(
         codes=codes,
@@ -267,6 +281,8 @@ def load_config(path: str, allow_empty_subscription: bool = False) -> AppConfig:
         mode=mode,
         close_delay_ms=close_delay_ms,
         preload_days=preload_days,
+        reconnect_timeout_sec=reconnect_timeout_sec,
+        reconnect_backoff_sec=reconnect_backoff_sec,
     )
 
     # --- Mock ---
@@ -312,6 +328,7 @@ def load_config(path: str, allow_empty_subscription: bool = False) -> AppConfig:
     health_sec = HealthSection(
         enabled=bool(health_raw.get("enabled", False)),
         key_prefix=str(health_raw.get("key_prefix", "xt:bridge:health")),
+        current_key=str(health_raw.get("current_key", "xt:bridge:health:current")),
         interval_sec=int(health_raw.get("interval_sec", 5)),
         ttl_sec=int(health_raw.get("ttl_sec", 20)),
         instance_tag=health_raw.get("instance_tag", None),

@@ -37,9 +37,9 @@ class SubscriptionSpec:
 
 class Registry:
     """类说明：订阅注册表（Redis 持久化）
-    功能：保存/查询/删除订阅规格，提供重启恢复数据；
+    功能：保存、查询和删除当前实时进程的协议订阅规格；
     上游：控制面；
-    下游：运行入口（重放订阅）。
+    下游：状态查询与按 `sub_id` 退订。新实时进程启动时会清理旧记录，不重放订阅。
     """
     def __init__(self, host: str, port: int, password: Optional[str], db: int, prefix: str = "xt:bridge") -> None:
         if _IMPORT_ERR is not None:

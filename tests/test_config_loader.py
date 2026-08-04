@@ -42,6 +42,11 @@ subscription:
   mode: close_only
   close_delay_ms: 150
   preload_days: 2
+  reconnect_timeout_sec: 60
+  reconnect_backoff_sec: [1, 2, 4]
+health:
+  enabled: true
+  current_key: xt:bridge:health:current
 logging:
   level: DEBUG
   json: false
@@ -57,6 +62,9 @@ logging:
         self.assertEqual(cfg.subscription.mode, "close_only")
         self.assertEqual(cfg.subscription.close_delay_ms, 150)
         self.assertEqual(cfg.subscription.preload_days, 2)
+        self.assertEqual(cfg.subscription.reconnect_timeout_sec, 60.0)
+        self.assertEqual(cfg.subscription.reconnect_backoff_sec, [1.0, 2.0, 4.0])
+        self.assertEqual(cfg.health.current_key, "xt:bridge:health:current")
         self.assertEqual(cfg.logging.level, "DEBUG")
         os.remove(path)
 
@@ -174,4 +182,6 @@ subscription:
         self.assertEqual(cfg.qmt.mode, "none")
         self.assertEqual(cfg.redis.host, "127.0.0.1")
         self.assertEqual(cfg.logging.level, "INFO")
+        self.assertEqual(cfg.subscription.reconnect_timeout_sec, 60.0)
+        self.assertEqual(cfg.subscription.reconnect_backoff_sec, [1.0, 2.0, 4.0, 8.0, 10.0])
         os.remove(path)

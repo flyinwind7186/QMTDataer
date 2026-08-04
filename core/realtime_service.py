@@ -29,6 +29,7 @@ import math
 import random
 import threading
 import time
+import uuid
 from dataclasses import dataclass, field
 from typing import Dict, Any, List, Tuple, Optional
 from collections import deque
@@ -42,6 +43,27 @@ from core.time_utils import parse_local_naive_time_series
 
 CN_TZ = timezone(timedelta(hours=8))
 MARKET_NUMERIC_DECIMALS = 10
+PROTOCOL_VERSION = 2
+
+SERVICE_STARTING = "STARTING"
+SERVICE_READY = "READY"
+SERVICE_RECONNECTING = "RECONNECTING"
+SERVICE_STOPPING = "STOPPING"
+SERVICE_ERROR = "ERROR"
+
+
+class RealtimeRecoveryError(RuntimeError):
+    """
+    MiniQMT 会话在有限恢复窗口内未能恢复。
+
+    该异常应传播到进程入口，使真实行情进程以非零状态退出。
+    """
+
+
+class RealtimeServiceUnavailable(RuntimeError):
+    """
+    实时服务当前状态不允许修改底层订阅。
+    """
 
 # QMT xtdata
 try:  # pragma: no cover
@@ -68,6 +90,10 @@ class RealtimeConfig:
     codes: List[str] = field(default_factory=list)
     close_delay_ms: int = 100                    # 若做延迟收盘判定（当前版本未启用队列延迟，仅保留配置）
     preload_days: int = 3                        # 新增订阅时历史预热天数（0 表示不预热）
+    reconnect_timeout_sec: float = 60.0
+    reconnect_backoff_sec: List[float] = field(
+        default_factory=lambda: [1.0, 2.0, 4.0, 8.0, 10.0]
+    )
 
     # 可选：去重容量限制（LRU）
     dedup_max_size: int = 50000
@@ -498,10 +524,22 @@ class RealtimeSubscriptionService:
         # 并发保护
         self._lock = threading.RLock()
 
-        # 当前活跃行情流集合，作为对外状态与 MockFeeder 的兼容视图。
+        # `_subs` 保留为业务期望流的兼容视图，底层真实状态由 `_active_streams` 表示。
         self._subs: set[Tuple[str, str]] = set()
+        self._active_streams: set[Tuple[str, str]] = set()
         self._sub_ref_counts: Dict[Tuple[str, str], int] = {}
         self._quote_sub_ids: Dict[Tuple[str, str], Any] = {}
+
+        # 会话身份和状态仅属于实时行情进程，不复用 HTTP Bridge 的实例身份。
+        self._instance_id = str(uuid.uuid4())
+        self._instance_started_at_ms = int(time.time() * 1000)
+        self._session_generation = 1
+        self._reconnect_count = 0
+        self._service_state = SERVICE_STARTING
+        self._last_error: Optional[str] = None
+        self._stop_evt = threading.Event()
+        self._active_callback_token: Optional[object] = object()
+        self._startup_prepared = False
 
         # 去重：LRU + 集合
         self._dedup_set: set[Tuple[Any, ...]] = set()
@@ -520,11 +558,19 @@ class RealtimeSubscriptionService:
     # 入口：阻塞运行
     # ----------------------------------------------------------------------
     def run_forever(self) -> None:
-        """方法说明：阻塞运行生命周期"""
-        if self.cfg.codes and self.cfg.periods:
-            self.add_subscription(self.cfg.codes, self.cfg.periods, preload_days=self.cfg.preload_days)
+        """
+        阻塞运行实时行情生命周期。
 
+        真实行情会话非预期结束时，在软期限内重连并重建全部期望行情流。人工停止时不进入
+        重连；恢复失败时抛出 `RealtimeRecoveryError`，由进程入口形成非零退出码。
+
+        Returns:
+            None
+        """
         if self.cfg.mock.enabled:
+            if self.cfg.codes and self.cfg.periods:
+                self.add_subscription(self.cfg.codes, self.cfg.periods, preload_days=self.cfg.preload_days)
+            self._set_service_state(SERVICE_READY)
             self._log.info("[RT] mock 行情模式启用（step=%.2fs, base=%.2f, vol=%.4f）",
                            float(self.cfg.mock.step_seconds or 1.0),
                            self.cfg.mock.base_price,
@@ -545,11 +591,227 @@ class RealtimeSubscriptionService:
         if xtdata is None:
             raise RuntimeError(f"缺少依赖或 QMT/MiniQMT 未正确安装：{_XT_IMPORT_ERR}")
 
-        self._log.info("[RT] xtdata.run() 开始阻塞运行")
         try:
-            xtdata.run()
+            self._prepare_real_session()
+            while not self._stop_evt.is_set():
+                self._log.info(
+                    "[RT] xtdata.run() 开始阻塞运行 generation=%d",
+                    self._session_generation,
+                )
+                run_error: Optional[Exception] = None
+                try:
+                    xtdata.run()
+                except KeyboardInterrupt:
+                    self._log.info("[RT] 接收到人工中断，停止真实行情服务。")
+                    self._stop_evt.set()
+                except Exception as exc:
+                    if self._stop_evt.is_set():
+                        self._log.info("[RT] 人工停止已使 xtdata.run() 结束。")
+                    else:
+                        run_error = exc
+                        self._log.warning("[RT] xtdata.run() 非预期结束: %s", exc)
+
+                if self._stop_evt.is_set():
+                    break
+                if not self._recover_real_session(run_error):
+                    if self._stop_evt.is_set():
+                        break
+                    message = self._last_error or "MiniQMT 会话恢复失败"
+                    raise RealtimeRecoveryError(message)
+        except RealtimeRecoveryError:
+            raise
+        except Exception as exc:
+            if not self._stop_evt.is_set():
+                self._set_service_state(SERVICE_ERROR, f"{type(exc).__name__}: {exc}")
+            raise
         finally:
-            self._log.info("[RT] xtdata.run() 结束")
+            if self._service_state != SERVICE_ERROR:
+                self._set_service_state(SERVICE_STOPPING)
+            self._disconnect_xtdata()
+            self._log.info("[RT] xtdata.run() 生命周期结束 state=%s", self._service_state)
+
+    def _prepare_real_session(self) -> None:
+        """
+        建立初始 xtdata 会话并注册配置中的初始行情流。
+
+        Returns:
+            None
+
+        Note:
+            初次启动失败不使用 60 秒恢复窗口，异常直接交给进程入口形成非零退出。
+        """
+        if self._startup_prepared:
+            return
+        self._connect_xtdata()
+        if self.cfg.codes and self.cfg.periods:
+            self.add_subscription(
+                self.cfg.codes,
+                self.cfg.periods,
+                preload_days=self.cfg.preload_days,
+            )
+        with self._lock:
+            if self._subs != self._active_streams:
+                raise RuntimeError("初始行情流未全部建立")
+            self._startup_prepared = True
+        self._set_service_state(SERVICE_READY)
+
+    def _connect_xtdata(self) -> Any:
+        """
+        建立 xtdata 会话并执行最小连接状态校验。
+
+        Returns:
+            Any: xtdata 客户端对象；测试替身未提供客户端时可为 `None`。
+        """
+        if hasattr(xtdata, "reconnect"):
+            client = xtdata.reconnect()
+        elif hasattr(xtdata, "get_client"):
+            client = xtdata.get_client()
+        else:
+            client = None
+        if client is not None and hasattr(client, "is_connected") and not client.is_connected():
+            raise RuntimeError("xtdata 客户端未连接 MiniQMT")
+        return client
+
+    def _recover_real_session(self, run_error: Optional[Exception]) -> bool:
+        """
+        在软期限内恢复 MiniQMT 会话和全部期望行情流。
+
+        Args:
+            run_error (Optional[Exception]): 导致 `xtdata.run()` 结束的原始异常。
+
+        Returns:
+            bool: 全部行情流恢复成功时返回 `True`，否则返回 `False`。
+        """
+        self._begin_reconnecting(run_error)
+        timeout = max(0.0, float(self.cfg.reconnect_timeout_sec))
+        deadline = time.monotonic() + timeout
+        backoffs = [max(0.0, float(item)) for item in self.cfg.reconnect_backoff_sec] or [1.0]
+        attempt = 0
+
+        while not self._stop_evt.is_set() and time.monotonic() < deadline:
+            if attempt > 0:
+                delay = backoffs[min(attempt - 1, len(backoffs) - 1)]
+                remaining = deadline - time.monotonic()
+                if remaining <= 0 or self._stop_evt.wait(min(delay, remaining)):
+                    break
+
+            attempt += 1
+            candidate_ids: Dict[Tuple[str, str], Any] = {}
+            candidate_token = object()
+            with self._lock:
+                desired = sorted(self._subs)
+                candidate_generation = self._session_generation + 1
+
+            try:
+                if time.monotonic() >= deadline:
+                    break
+                self._log.info("[RT] 尝试恢复 MiniQMT 会话 attempt=%d", attempt)
+                self._connect_xtdata()
+                if time.monotonic() >= deadline:
+                    raise TimeoutError("xtdata.reconnect() 返回时已超过恢复软期限")
+
+                for code, period in desired:
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError("重建底层订阅时已超过恢复软期限")
+                    sub_id = self._register_one(
+                        code,
+                        period,
+                        callback_generation=candidate_generation,
+                        callback_token=candidate_token,
+                    )
+                    if sub_id is None:
+                        raise RuntimeError(f"底层订阅未返回 ID: {code} {period}")
+                    candidate_ids[(code, period)] = sub_id
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError("subscribe_quote() 返回时已超过恢复软期限")
+
+                with self._lock:
+                    if set(desired) != self._subs:
+                        raise RuntimeError("恢复期间 desired_streams 发生变化")
+                    self._quote_sub_ids = candidate_ids
+                    self._active_streams = set(desired)
+                    self._session_generation = candidate_generation
+                    self._active_callback_token = candidate_token
+                    self._reconnect_count += 1
+                    self._last_error = None
+                    self._service_state = SERVICE_READY
+                self._log.info(
+                    "[RT] MiniQMT 会话恢复成功 generation=%d streams=%d",
+                    candidate_generation,
+                    len(desired),
+                )
+                return True
+            except KeyboardInterrupt:
+                self._stop_evt.set()
+                self._last_error = None
+                self._discard_candidate_subscriptions(candidate_ids)
+                return False
+            except Exception as exc:
+                self._set_service_state(
+                    SERVICE_RECONNECTING,
+                    f"{type(exc).__name__}: {exc}",
+                )
+                self._log.warning("[RT] MiniQMT 会话恢复失败 attempt=%d err=%s", attempt, exc)
+                self._discard_candidate_subscriptions(candidate_ids)
+
+        if self._stop_evt.is_set():
+            return False
+        with self._lock:
+            self._service_state = SERVICE_ERROR
+            if not self._last_error:
+                self._last_error = "MiniQMT 会话恢复超过软期限"
+        self._log.error("[RT] MiniQMT 会话恢复最终失败: %s", self._last_error)
+        return False
+
+    def _begin_reconnecting(self, run_error: Optional[Exception]) -> None:
+        """
+        切换到重连状态并废弃旧会话的底层状态。
+
+        Args:
+            run_error (Optional[Exception]): 会话结束异常；正常返回时为 `None`。
+
+        Returns:
+            None
+        """
+        with self._lock:
+            self._service_state = SERVICE_RECONNECTING
+            self._last_error = (
+                f"{type(run_error).__name__}: {run_error}"
+                if run_error is not None
+                else "xtdata.run() 非预期返回"
+            )
+            self._active_streams.clear()
+            self._quote_sub_ids.clear()
+            self._bar_states.clear()
+            self._active_callback_token = None
+
+    def _discard_candidate_subscriptions(self, candidate_ids: Dict[Tuple[str, str], Any]) -> None:
+        """
+        尽力退订本轮已创建但未提交的候选订阅。
+
+        Args:
+            candidate_ids (Dict[Tuple[str, str], Any]): 候选底层订阅 ID。
+
+        Returns:
+            None
+        """
+        for (code, period), sub_id in candidate_ids.items():
+            self._unsubscribe_one(code, period, sub_id)
+
+    @staticmethod
+    def _disconnect_xtdata() -> None:
+        """
+        尽力断开 xtdata 会话。
+
+        Returns:
+            None
+        """
+        if xtdata is None or not hasattr(xtdata, "disconnect"):
+            return
+        try:
+            xtdata.disconnect()
+        except Exception:
+            pass
 
     # ----------------------------------------------------------------------
     # 动态增删订阅
@@ -566,6 +828,7 @@ class RealtimeSubscriptionService:
             引用计数按 `(code, period)` 统计。重复订阅同一行情流只增加计数，不重复调用
             `xtdata.subscribe_quote`。
         """
+        self._ensure_subscription_mutation_allowed()
         days = int(preload_days if preload_days is not None else self.cfg.preload_days or 0)
         if not self.cfg.mock.enabled and days > 0:
             self._preload_history(codes, periods, days)
@@ -580,8 +843,14 @@ class RealtimeSubscriptionService:
                         self._log.info("[RT] 订阅引用增加: %s %s ref=%d", c, p, current_ref + 1)
                         continue
                     if not self.cfg.mock.enabled:
-                        self._quote_sub_ids[key] = self._register_one(c, p)
+                        sub_id = self._register_one(c, p)
+                        if sub_id is None:
+                            raise RuntimeError(f"底层订阅未返回 ID: {c} {p}")
+                        self._quote_sub_ids[key] = sub_id
+                        self._active_streams.add(key)
                     self._subs.add(key)
+                    if self.cfg.mock.enabled:
+                        self._active_streams.add(key)
                     self._sub_ref_counts[key] = 1
                     if self.cfg.mock.enabled:
                         self._log.info("[RT] Mock 订阅已登记: %s %s ref=1", c, p)
@@ -601,6 +870,7 @@ class RealtimeSubscriptionService:
         Note:
             如果同一 `(code, period)` 仍被其他策略引用，只减少计数，不调用底层退订。
         """
+        self._ensure_subscription_mutation_allowed()
         with self._lock:
             for c in codes:
                 for p in periods:
@@ -619,6 +889,7 @@ class RealtimeSubscriptionService:
                     self._quote_sub_ids.pop(key, None)
                     self._sub_ref_counts.pop(key, None)
                     self._subs.discard(key)
+                    self._active_streams.discard(key)
                     self._bar_states.pop(key, None)
                     if self.cfg.mock.enabled:
                         self._log.info("[RT] Mock 订阅已移除: %s %s", c, p)
@@ -667,9 +938,46 @@ class RealtimeSubscriptionService:
             return list(self._subs)
 
     def stop(self) -> None:
-        """方法说明：停止实时服务（目前用于 Mock 模式）"""
+        """
+        请求实时服务人工停止。
+
+        Returns:
+            None
+        """
+        self._stop_evt.set()
+        if self._service_state != SERVICE_ERROR:
+            self._set_service_state(SERVICE_STOPPING)
         if self.cfg.mock.enabled and self._mock_feeder:
             self._mock_feeder.stop()
+        elif not self.cfg.mock.enabled:
+            self._disconnect_xtdata()
+
+    def _ensure_subscription_mutation_allowed(self) -> None:
+        """
+        拒绝在重连、停止或错误状态下修改订阅结构。
+
+        Returns:
+            None
+        """
+        if self.cfg.mock.enabled:
+            return
+        with self._lock:
+            state = self._service_state
+        if state in {SERVICE_RECONNECTING, SERVICE_STOPPING, SERVICE_ERROR}:
+            raise RealtimeServiceUnavailable(f"service_{state.lower()}")
+
+    def control_mutation_error(self) -> Optional[str]:
+        """
+        返回控制面修改订阅时应使用的错误码。
+
+        Returns:
+            Optional[str]: READY 时返回 `None`，其他状态返回稳定错误码。
+        """
+        with self._lock:
+            state = self._service_state
+        if state == SERVICE_READY:
+            return None
+        return f"service_{state.lower()}"
 
     # ----------------------------------------------------------------------
     # 订阅注册与回调处理
@@ -683,15 +991,31 @@ class RealtimeSubscriptionService:
             return None
         return pd.Timestamp(parsed).strftime("%Y-%m-%dT%H:%M:%S")
 
-    def _register_one(self, code: str, period: str) -> Any:
-        """方法说明：注册单标的/单周期订阅（官方签名回调）
-        功能：
-            - 向 xtdata.subscribe_quote 发起订阅（使用关键字参数）；
-            - 绑定符合签名的回调函数 _cb(datas)；
-        回调参数 datas：
-            - 字典：{ stock_code: [data1, data2, ...] }
+    def _register_one(
+        self,
+        code: str,
+        period: str,
+        callback_generation: Optional[int] = None,
+        callback_token: Optional[object] = None,
+    ) -> Any:
         """
+        注册单标的、单周期底层订阅。
+
+        Args:
+            code (str): xtdata 标的代码。
+            period (str): xtdata 行情周期。
+            callback_generation (Optional[int]): 回调所属会话代次。
+            callback_token (Optional[object]): 回调所属尝试的内部隔离令牌。
+
+        Returns:
+            Any: `xtdata.subscribe_quote()` 返回的内部订阅 ID。
+        """
+        generation = callback_generation if callback_generation is not None else self._session_generation
+        token = callback_token if callback_token is not None else self._active_callback_token
+
         def _cb(datas: Dict[str, List[Dict[str, Any]]]):
+            if not self._is_current_callback(generation, token):
+                return
             try:
                 self._on_datas(period, datas)
             except Exception:
@@ -706,6 +1030,25 @@ class RealtimeSubscriptionService:
             count=0,
             callback=_cb
         )
+
+    def _is_current_callback(self, generation: int, token: Optional[object]) -> bool:
+        """
+        判断回调是否属于当前已提交的 xtdata 会话。
+
+        Args:
+            generation (int): 回调注册时的会话代次。
+            token (Optional[object]): 回调注册尝试的内部令牌。
+
+        Returns:
+            bool: 回调属于当前 READY 会话时返回 `True`。
+        """
+        with self._lock:
+            return (
+                self._service_state == SERVICE_READY
+                and generation == self._session_generation
+                and token is not None
+                and token is self._active_callback_token
+            )
 
     def _on_datas(self, period: str, datas: Dict[str, List[Dict[str, Any]]]) -> None:
         """方法说明：处理 QMT 回调数据（datas）
@@ -938,17 +1281,103 @@ class RealtimeSubscriptionService:
     # 状态查询
     # ----------------------------------------------------------------------
     def status(self) -> Dict[str, Any]:
-        """方法说明：返回服务状态
-        内容：
-            - subs：当前订阅数组 [{'code':..., 'period':..., 'ref_count':...}, ...]
-            - last_published：最近一次发布时间（epoch 秒）按 (code, period) 组织
+        """
+        返回实时服务状态和会话身份。
+
+        Returns:
+            Dict[str, Any]: 当前服务状态、期望流、活跃流、引用计数及最近发布时间。
         """
         with self._lock:
             subs = sorted([{
                 "code": c,
                 "period": p,
                 "ref_count": int(self._sub_ref_counts.get((c, p), 0)),
-            } for (c, p) in self._subs],
+            } for (c, p) in self._active_streams],
                           key=lambda x: (x["code"], x["period"]))
             last_pub = {f"{c}|{p}": ts for (c, p), ts in self._last_pub_ts.items()}
-        return {"subs": subs, "last_published": last_pub}
+            desired = self._stream_payload(self._subs)
+            active = self._stream_payload(self._active_streams)
+            payload = {
+                "service_state": self._service_state,
+                "desired_streams": desired,
+                "active_streams": active,
+                "subs": subs,
+                "last_published": last_pub,
+                "reconnect_count": self._reconnect_count,
+                "last_error": self._last_error,
+            }
+            payload.update(self.protocol_identity())
+        return payload
+
+    def protocol_identity(self) -> Dict[str, Any]:
+        """
+        返回 ACK 和健康协议共用的实时进程身份字段。
+
+        Returns:
+            Dict[str, Any]: 实例 UUID、启动时间、会话代次和协议版本。
+        """
+        with self._lock:
+            return {
+                "instance_id": self._instance_id,
+                "instance_started_at_ms": self._instance_started_at_ms,
+                "session_generation": self._session_generation,
+                "protocol_version": PROTOCOL_VERSION,
+            }
+
+    def health_snapshot(self) -> Dict[str, Any]:
+        """
+        构造固定健康键需要的线程安全快照。
+
+        Returns:
+            Dict[str, Any]: QMTD 实时行情进程健康协议 payload。
+        """
+        with self._lock:
+            return {
+                "service": "qmtdataer-realtime",
+                "instance_id": self._instance_id,
+                "instance_started_at_ms": self._instance_started_at_ms,
+                "session_generation": self._session_generation,
+                "protocol_version": PROTOCOL_VERSION,
+                "service_state": self._service_state,
+                "reconnect_count": self._reconnect_count,
+                "last_error": self._last_error,
+                "desired_streams": self._stream_payload(self._subs),
+                "active_streams": self._stream_payload(self._active_streams),
+                "last_published": {
+                    f"{code}|{period}": published_at
+                    for (code, period), published_at in self._last_pub_ts.items()
+                },
+                "updated_at_ms": int(time.time() * 1000),
+            }
+
+    def _set_service_state(self, state: str, error: Optional[str] = None) -> None:
+        """
+        原子更新实时服务状态。
+
+        Args:
+            state (str): 目标状态。
+            error (Optional[str]): 可选错误摘要。
+
+        Returns:
+            None
+        """
+        with self._lock:
+            self._service_state = state
+            if error is not None:
+                self._last_error = error
+
+    @staticmethod
+    def _stream_payload(streams: set[Tuple[str, str]]) -> List[Dict[str, str]]:
+        """
+        将内部行情流集合转换为稳定排序的协议结构。
+
+        Args:
+            streams (set[Tuple[str, str]]): `(code, period)` 集合。
+
+        Returns:
+            List[Dict[str, str]]: 按代码和周期排序的行情流列表。
+        """
+        return [
+            {"code": code, "period": period}
+            for code, period in sorted(streams)
+        ]

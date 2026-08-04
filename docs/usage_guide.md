@@ -7,7 +7,7 @@
 - **RealtimeSubscriptionService (`core/realtime_service.py`)**：负责历史预热、实时订阅、去重与 payload 组装，按契约 v0.5 推送到 Redis。
 - **PubSubPublisher (`core/pubsub_publisher.py`)**：将宽表 JSON 发布到 Redis PubSub 主题，带最小重试与指标计数。
 - **ControlPlane (`core/control_plane.py`)**：监听控制通道 `subscribe/status/unsubscribe` 命令，联动 `Registry` 与实时服务。
-- **Registry (`core/registry.py`)**：以 Redis 存储订阅规格，为重启恢复提供来源。
+- **Registry (`core/registry.py`)**：保存当前实时进程订阅规格，用于状态查询和按 `sub_id` 退订；新进程不恢复旧记录。
 - **HistoryAPI (`core/history_api.py`)**：封装“先补后取”的历史查询流程（`download_history_data` → `get_market_data_ex` → 宽表）。
 - **Metrics (`core/metrics.py`)**：线程安全的指标集合，兼容实例级计数并提供全局指标（`bars_published_total` 等）。
 - **HealthReporter (`core/health.py`)**：可选线程，周期性写入健康信息至 Redis。
@@ -47,6 +47,8 @@
 | `mode` | `close_only`（仅收盘推送）或 `forming_and_close` | `close_only` |
 | `close_delay_ms` | 收盘延迟判定（毫秒） | `100` |
 | `preload_days` | 启动预热天数（历史补齐） | `3` |
+| `reconnect_timeout_sec` | xtdata 会话恢复软期限（秒） | `60` |
+| `reconnect_backoff_sec` | 重连退避秒数列表 | `[1, 2, 4, 8, 10]` |
 
 ### 3.4 `logging`
 控制控制台/文件输出及轮转：
@@ -58,7 +60,8 @@
 ### 3.5 `health`
 启用健康上报需提供：
 - `enabled`: `true`
-- `key_prefix`: Redis Key 前缀（最终 key: `prefix:host:pid[:tag]`）
+- `key_prefix`: 兼容健康键前缀
+- `current_key`: 实时行情进程固定健康键，默认 `xt:bridge:health:current`
 - `interval_sec`: 写入频率（秒）
 - `ttl_sec`: 键过期时间
 - `instance_tag`: 可选实例标识
@@ -224,16 +227,21 @@ result = api.fetch_bars(
 ## 8. 指标与健康采集
 - **实例指标**：通过 `Metrics().snapshot()` 获取 `published/publish_fail/dedup_hit`，用于健康上报或调试。
 - **全局指标**：`Metrics.snapshot_global()` 返回 `bars_published_total/schema_drop_total/late_bars_total`。
-- **健康上报**：启用 `HealthReporter` 后，Redis 会写入键 `key_prefix:hostname:pid[:instance_tag]`，值为：
+- **健康上报**：真实行情入口启用 `HealthReporter` 后，Redis 会写入固定键
+  `xt:bridge:health:current`，值为：
   ```json
   {
-    "ts": 1694930000,
-    "instance_id": "host:pid[:tag]",
-    "metrics": {"published": 10, ...},
-    "extra": {"codes": [...], "periods": [...], ...}
+    "service": "qmtdataer-realtime",
+    "instance_id": "realtime-process-uuid",
+    "session_generation": 2,
+    "protocol_version": 2,
+    "service_state": "READY",
+    "desired_streams": [],
+    "active_streams": [],
+    "updated_at_ms": 1785800060000
   }
   ```
-  可用于 Prometheus-exporter 或脚本监控。
+  健康键只描述实时行情进程，不复用 HTTP Bridge 身份。
 
 ## 9. 日志与排查
 - 日志初始化由 `core/logging_utils.py` 完成，支持控制台与文件输出。
@@ -258,7 +266,7 @@ result = api.fetch_bars(
 | 启动服务 | `python scripts/run_with_config.py --config config/realtime.yml` |
 | Demo 启动 | `REDIS_URL=redis://host:port/db python scripts/run_with_config.py` |
 | 手工订阅 | `redis-cli PUBLISH xt:ctrl:sub '{"action":"subscribe",...}'` |
-| 查看健康键 | `redis-cli --raw GET xt:bridge:health:host:pid` |
+| 查看健康键 | `redis-cli --raw GET xt:bridge:health:current` |
 | 调用历史 API | 参考 §7 Python 样例 |
 
 > 若后续扩展更多功能（如 forming 推送、ClickHouse 落库等），请同步更新此文档和契约文件 `docs/contract_v0.5.md`。

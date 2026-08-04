@@ -119,6 +119,7 @@ class TestRealtimeService(unittest.TestCase):
         cfg = RealtimeConfig(mode="close_only", periods=["1m", "1d"], codes=["000001.SZ", "600000.SH"], preload_days=3)
         svc = RealtimeSubscriptionService(cfg, pub, cache=cache)
         with mock.patch("xtquant.xtdata.run") as mrun, mock.patch("xtquant.xtdata.subscribe_quote") as msub:
+            mrun.side_effect = KeyboardInterrupt
             svc.run_forever()
             # 预热按 period 调用 2 次（codes 作为整体传入）
             self.assertEqual(len(cache.calls), 1)
@@ -237,6 +238,7 @@ class TestRealtimeService(unittest.TestCase):
         cfg = RealtimeConfig(mode="close_only", periods=["1m"], codes=["000001.SZ"], preload_days=0)
         svc = RealtimeSubscriptionService(cfg, pub, cache=cache)
         with mock.patch("xtquant.xtdata.run") as mrun, mock.patch("xtquant.xtdata.subscribe_quote") as msub:
+            mrun.side_effect = KeyboardInterrupt
             svc.run_forever()
             self.assertEqual(len(cache.calls), 0)
             self.assertEqual(msub.call_count, 1)

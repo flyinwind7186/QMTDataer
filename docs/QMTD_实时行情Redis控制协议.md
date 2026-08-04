@@ -64,6 +64,12 @@ ACK 通用字段：
 | `ok` | bool | 是 | 命令是否处理成功 |
 | `action` | string | 否 | 成功时通常返回对应命令类型 |
 | `error` | string | 否 | 失败原因 |
+| `instance_id` | string | 是 | 当前 QMTD 实时行情进程 UUID |
+| `instance_started_at_ms` | int | 是 | 当前实时进程启动时间，epoch 毫秒 |
+| `session_generation` | int | 是 | 当前 xtdata 会话代次，初始为 1 |
+| `protocol_version` | int | 是 | 当前协议版本，第一版会话恢复固定为 2 |
+
+这里的 `instance_id` 只代表 QMTD 实时行情进程，不复用 HTTP Bridge 的实例身份。
 
 ## 4. subscribe
 
@@ -101,7 +107,11 @@ ACK 通用字段：
   "codes": ["510050.SH", "518880.SH"],
   "periods": ["1m"],
   "mode": "close_only",
-  "topic": "xt:topic:bar"
+  "topic": "xt:topic:bar",
+  "instance_id": "realtime-process-uuid",
+  "instance_started_at_ms": 1785800000000,
+  "session_generation": 1,
+  "protocol_version": 2
 }
 ```
 
@@ -122,6 +132,7 @@ ACK 通用字段：
 - `strategy_id` 不在允许列表中。
 - `codes` 或 `periods` 为空。
 - QMTD 底层订阅失败。
+- QMTD 处于 `STARTING`、`RECONNECTING`、`STOPPING` 或 `ERROR`，不能安全修改订阅。
 
 ## 5. unsubscribe
 
@@ -216,14 +227,31 @@ ACK 通用字段：
   "ok": true,
   "action": "status",
   "status": {
+    "service_state": "READY",
+    "desired_streams": [
+      {"code": "510050.SH", "period": "1m"}
+    ],
+    "active_streams": [
+      {"code": "510050.SH", "period": "1m"}
+    ],
     "subs": [
       {"code": "510050.SH", "period": "1m", "ref_count": 2}
     ],
     "last_published": {
       "510050.SH|1m": 1770000000.0
-    }
+    },
+    "reconnect_count": 0,
+    "last_error": null,
+    "instance_id": "realtime-process-uuid",
+    "instance_started_at_ms": 1785800000000,
+    "session_generation": 1,
+    "protocol_version": 2
   },
-  "subs": ["sub-20260423-103000-xxxxxxxx"]
+  "subs": ["sub-20260423-103000-xxxxxxxx"],
+  "instance_id": "realtime-process-uuid",
+  "instance_started_at_ms": 1785800000000,
+  "session_generation": 1,
+  "protocol_version": 2
 }
 ```
 
@@ -234,37 +262,15 @@ ACK 通用字段：
 
 - 判断当前 QMTD 是否仍在推某个底层行情流，应以 `status.status.subs` 为准。
 - 顶层 `subs` 来自 Registry，表示注册表中保存的协议 `sub_id` 列表。
-- Registry 可能存在历史遗留 `sub_id`，顶层 `subs` 不等价于当前活跃底层订阅。
+- 新实时进程启动时会清理旧进程 Registry，不自动加载或恢复旧 `sub_id`。
 - 策略端退订后，建议再发送一次 `status`，确认目标 `(code, period)` 已从 `status.status.subs` 中消失。
 
-### 6.3 后续增强方向
+### 6.3 desired_streams 与 active_streams
 
-后续建议将状态增强为更可诊断的结构：
-
-```json
-{
-  "ok": true,
-  "action": "status",
-  "status": {
-    "active_streams": [
-      {
-        "code": "510050.SH",
-        "period": "1m",
-        "ref_count": 2,
-        "last_published_ts": "2026-04-23T10:30:00"
-      }
-    ],
-    "strategy_subscriptions": [
-      {
-        "strategy_id": "ma_cross_demo",
-        "sub_ids": ["sub-20260423-103000-xxxxxxxx"]
-      }
-    ]
-  }
-}
-```
-
-该增强只用于诊断，不应变成 BTLive 对 QMTD 的服务治理接口。
+- `desired_streams`：当前协议引用计数要求 QMTD 保持的行情流。
+- `active_streams`：当前 xtdata 会话中已成功取得底层订阅 ID 的行情流。
+- `READY` 状态下两者必须一致。
+- `RECONNECTING` 状态下保留 `desired_streams`，`active_streams` 暂时为空。
 
 ## 7. 幂等与重复命令规则
 
@@ -319,6 +325,41 @@ QMTD 应尽量返回结构化 ACK，而不是让调用方只能依赖日志。
 ```
 
 第一阶段先保持兼容当前实现，不强制引入 `error_code`。
+
+### 8.1 MiniQMT 会话有限恢复
+
+真实行情进程使用以下最小状态：
+
+```text
+STARTING -> READY -> RECONNECTING -> READY
+STARTING -> ERROR
+RECONNECTING -> ERROR
+READY/RECONNECTING -> STOPPING
+```
+
+`xtdata.run()` 非预期结束后，QMTD 从检测时点开始执行 60 秒软期限恢复：
+
+- 每次 `reconnect()` 和 `subscribe_quote()` 前后检查剩余时间。
+- 到达期限后不再发起新尝试；同步调用超期返回后立即判定失败。
+- 恢复时只重建当前 `desired_streams`，不补行情、不追平、不回放。
+- 全部底层订阅成功后才递增 `session_generation`、`reconnect_count` 并恢复 `READY`。
+- 恢复期间 `status` 可用，`subscribe/unsubscribe` 返回 `service_reconnecting`。
+- 恢复失败时进入 `ERROR`，QMTD 真实行情进程以非零状态退出。
+- 同进程恢复保持 `instance_id`；进程重启必须生成新 `instance_id`。
+
+不得根据午休、收盘、周末、节假日、停牌或长时间没有 bar 触发重连。
+
+### 8.2 固定健康键
+
+真实行情入口默认每 5 秒使用 Redis `SET` 刷新：
+
+```text
+xt:bridge:health:current
+```
+
+TTL 默认 20 秒，payload 至少包含 `instance_id`、`session_generation`、`service_state`、
+`reconnect_count`、`desired_streams`、`active_streams`、`last_published` 和 `updated_at_ms`。
+退出时仅当固定键仍属于自身 `instance_id` 才删除，避免旧进程误删新实例健康信息。
 
 ## 9. 调用方建议
 
@@ -388,4 +429,4 @@ QMTD 空白启动
 }
 ```
 
-上例中 `status.subs=[]` 表示当前没有活跃底层行情流；顶层 `subs` 仅表示 Registry 中仍有历史记录。
+上例是旧协议联调记录。协议版本 2 启动时会清理旧进程 Registry，因此新进程不会继续展示历史遗留 `sub_id`。

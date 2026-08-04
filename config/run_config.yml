@@ -16,6 +16,8 @@ subscription:
   mode: close_only
   close_delay_ms: 100
   preload_days: 1
+  reconnect_timeout_sec: 60
+  reconnect_backoff_sec: [1, 2, 4, 8, 10]
 
 logging:
   level: INFO
@@ -27,8 +29,9 @@ logging:
     backup_count: 5
 
 health:
-  enabled: false
+  enabled: true
   key_prefix: xt:bridge:health
+  current_key: xt:bridge:health:current
   interval_sec: 5
   ttl_sec: 20
   instance_tag: bridge-A
